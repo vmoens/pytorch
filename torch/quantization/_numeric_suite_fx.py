@@ -498,3 +498,33 @@ def extend_logger_results_with_comparison(
                 for value_1, value_2 in zip(values_1, values_2):
                     comparison_result = comparison_fn(value_1, value_2)
                     result_2[comparison_name].append(comparison_result)
+
+def add_fully_qualified_names_to_logger_results(
+    results: NSResultsType,
+    model: nn.Module,
+    model_name: str,
+) -> None:
+    """
+    For each logged value from `model_name`, adds the fully qualified names
+    found in `model` under the field, 'fully_qualified_name'.
+
+    The fully qualified name can be found by tracing the `model` and using the
+    node_name_to_scope to map the 'ref_node_name' field in the logger to fully
+    qualified names.
+    """
+
+    # Trace the model so that we can find the accurate node_name_to_scope
+    tracer = quantize_fx.QuantizationTracer([], [])
+    tracer.trace(model)
+
+    for _, results_type_to_results in results.items():
+        for _, model_name_to_results in results_type_to_results.items():
+            assert model_name in model_name_to_results, \
+                f"{model_name} not found in results"
+
+            for result in model_name_to_results[model_name]:
+                fully_qualified_name = tracer.node_name_to_scope[result['ref_node_name']][0]
+                if fully_qualified_name == '':
+                    fully_qualified_name = result['ref_node_name']
+
+                result['fully_qualified_name'] = fully_qualified_name
