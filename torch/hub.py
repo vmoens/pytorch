@@ -9,7 +9,7 @@ import tempfile
 import torch
 import warnings
 import zipfile
-
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen, Request
 from urllib.parse import urlparse  # noqa: F401
@@ -56,6 +56,7 @@ except ImportError:
 # matches bfd8deac from resnet18-bfd8deac.pth
 HASH_REGEX = re.compile(r'-([a-f0-9]*)\.')
 
+_TRUSTED_REPO_PREFIXES = ("facebookresearch", "facebookincubator", "pytorch", "fairinternal")
 ENV_GITHUB_TOKEN = 'GITHUB_TOKEN'
 ENV_TORCH_HOME = 'TORCH_HOME'
 ENV_XDG_CACHE_HOME = 'XDG_CACHE_HOME'
@@ -161,7 +162,7 @@ def _validate_not_a_forked_repo(repo_owner, repo_name, branch):
                      'If it\'s a commit from a forked repo, please call hub.load() with forked repo directly.')
 
 
-def _get_cache_or_reload(github, force_reload, verbose=True, skip_validation=False):
+def _get_cache_or_reload(github, force_reload, verbose=True, skip_validation=False, trust_repo=None, calling_fn="load"):
     # Setup hub_dir to save downloaded files
     hub_dir = get_dir()
     if not os.path.exists(hub_dir):
@@ -178,6 +179,8 @@ def _get_cache_or_reload(github, force_reload, verbose=True, skip_validation=Fal
     # and inspect name from it.
     # To check if cached repo exists, we need to normalize folder names.
     repo_dir = os.path.join(hub_dir, '_'.join([repo_owner, repo_name, normalized_br]))
+    # Check that the repo is in the trusted list
+    _check_repo('_'.join([repo_owner, repo_name]), trust_repo=trust_repo, calling_fn=calling_fn)
 
     use_cache = (not force_reload) and os.path.exists(repo_dir)
 
@@ -208,6 +211,58 @@ def _get_cache_or_reload(github, force_reload, verbose=True, skip_validation=Fal
         shutil.move(extracted_repo, repo_dir)  # rename the repo
 
     return repo_dir
+
+def _get_trusted_input(repo):
+    # separate function for testing
+    response = input(
+        f"The repository {repo} does not belong to the list of trusted repositories and as such cannot be downloaded. "
+        "Do you trust this repository and wish to add it to the trusted list of repositories (y/N)?")
+    return response
+
+def _check_repo(repo, trust_repo=None, calling_fn="load"):
+    hub_dir = get_dir()
+    filepath = os.path.join(hub_dir, "trusted_list")
+
+    if not os.path.exists(filepath):
+        Path(filepath).touch()
+
+        # Initialize with all existing repos
+        repos = next(os.walk(hub_dir))[1]
+        with open(filepath, "a") as file:
+            for _repo in repos:
+                file.write(_repo + "\n")
+
+    # load list
+    with open(filepath, 'r') as file:
+        trusted_repos = tuple(line.strip() for line in file)
+    is_trusted = any(repo == trusted_repo for trusted_repo in trusted_repos)
+    is_trusted = is_trusted or any(repo.startswith(trusted_repo) for trusted_repo in _TRUSTED_REPO_PREFIXES)
+
+    # to be deprecated
+    if trust_repo is None:
+        if not is_trusted:
+            warnings.warn(
+                "You are about to download an untrusted repository. In a future release, this won't be allowed. "
+                f"To add the repository to your trusted list, change the command to {calling_fn}(..., "
+                "trust_repo=False) and a command prompt will appear asking for an explicit confirmation of trust, "
+                f"or {calling_fn}(..., trust_repo=True), which will assume that the prompt is to be answered with "
+                f"'yes'.")
+        return
+
+    if (trust_repo is False) or (trust_repo == "check" and not is_trusted):
+        response = _get_trusted_input(repo)
+        if response.lower() in ("y", "yes"):
+            if is_trusted:
+                print("The repository is already trusted.")
+        elif response.lower() in ("n", "no", ""):
+            raise Exception("Untrusted repository.")
+        else:
+            raise ValueError(f"Unrecognized response {response}.")
+
+    # At this point we're sure that the user trusts the repo
+    if not is_trusted:
+        with open(filepath, "a") as file:
+            file.write(repo + "\n")
 
 
 def _check_module_exists(name):
@@ -272,7 +327,7 @@ def set_dir(d):
     _hub_dir = d
 
 
-def list(github, force_reload=False, skip_validation=False):
+def list(github, force_reload=False, skip_validation=False, trust_repo=None):
     r"""
     List all callable entrypoints available in the repo specified by ``github``.
 
@@ -287,13 +342,25 @@ def list(github, force_reload=False, skip_validation=False):
             specified by the ``github`` argument properly belongs to the repo owner. This will make
             requests to the GitHub API; you can specify a non-default GitHub token by setting the
             ``GITHUB_TOKEN`` environment variable. Default is ``False``.
+        trust_repo (bool, string or None): ``"check"``, ``True``, ``False`` or ``None``.
+            If ``False``, a prompt will appear and ask the user whether that repo should be trusted from now on.
+            If ``"check"``, the repo address will be checked in against the list of trusted repos in the cache. If it is
+            not present in that list, the behaviour will fall back onto the ``trust_repo=False`` option.
+            If ``True``, the repo will be added to the trusted list and loaded without requiring explicit confirmation.
+            of trust.
+            If ``None``, the presence of the repo in the trusted will be checked. If that check fails, the user will be
+            notified through a warning that the repo has not been formally added to the trusted list. In a future
+            release, that this behaviour will be deprecated in favour of ``"check"``.
+            Default is ``None``.
+
     Returns:
         list: The available callables entrypoint
 
     Example:
         >>> entrypoints = torch.hub.list('pytorch/vision', force_reload=True)
     """
-    repo_dir = _get_cache_or_reload(github, force_reload, verbose=True, skip_validation=skip_validation)
+    repo_dir = _get_cache_or_reload(github, force_reload, verbose=True, skip_validation=skip_validation,
+                                    trust_repo=trust_repo, calling_fn="list")
 
     sys.path.insert(0, repo_dir)
 
@@ -308,7 +375,7 @@ def list(github, force_reload=False, skip_validation=False):
     return entrypoints
 
 
-def help(github, model, force_reload=False, skip_validation=False):
+def help(github, model, force_reload=False, skip_validation=False, trust_repo=None):
     r"""
     Show the docstring of entrypoint ``model``.
 
@@ -324,10 +391,21 @@ def help(github, model, force_reload=False, skip_validation=False):
             specified by the ``github`` argument properly belongs to the repo owner. This will make
             requests to the GitHub API; you can specify a non-default GitHub token by setting the
             ``GITHUB_TOKEN`` environment variable. Default is ``False``.
+        trust_repo (bool, string or None): ``"check"``, ``True``, ``False`` or ``None``.
+            If ``False``, a prompt will appear and ask the user whether that repo should be trusted from now on.
+            If ``"check"``, the repo address will be checked in against the list of trusted repos in the cache. If it is
+            not present in that list, the behaviour will fall back onto the ``trust_repo=False`` option.
+            If ``True``, the repo will be added to the trusted list and loaded without requiring explicit confirmation.
+            of trust.
+            If ``None``, the presence of the repo in the trusted will be checked. If that check fails, the user will be
+            notified through a warning that the repo has not been formally added to the trusted list. In a future
+            release, that this behaviour will be deprecated in favour of ``"check"``.
+            Default is ``None``.
     Example:
         >>> print(torch.hub.help('pytorch/vision', 'resnet18', force_reload=True))
     """
-    repo_dir = _get_cache_or_reload(github, force_reload, verbose=True, skip_validation=skip_validation)
+    repo_dir = _get_cache_or_reload(github, force_reload, verbose=True, skip_validation=skip_validation,
+                                    trust_repo=trust_repo, calling_fn="help")
 
     sys.path.insert(0, repo_dir)
 
@@ -341,7 +419,8 @@ def help(github, model, force_reload=False, skip_validation=False):
     return entry.__doc__
 
 
-def load(repo_or_dir, model, *args, source='github', force_reload=False, verbose=True, skip_validation=False,
+def load(repo_or_dir, model, *args, source='github', trust_repo=None, force_reload=False, verbose=True,
+         skip_validation=False,
          **kwargs):
     r"""
     Load a model from a github repo or a local directory.
@@ -367,6 +446,16 @@ def load(repo_or_dir, model, *args, source='github', force_reload=False, verbose
         *args (optional): the corresponding args for callable ``model``.
         source (string, optional): 'github' or 'local'. Specifies how
             ``repo_or_dir`` is to be interpreted. Default is 'github'.
+        trust_repo (bool, string or None): ``"check"``, ``True``, ``False`` or ``None``.
+            If ``False``, a prompt will appear and ask the user whether that repo should be trusted from now on.
+            If ``"check"``, the repo address will be checked in against the list of trusted repos in the cache. If it is
+            not present in that list, the behaviour will fall back onto the ``trust_repo=False`` option.
+            If ``True``, the repo will be added to the trusted list and loaded without requiring explicit confirmation.
+            of trust.
+            If ``None``, the presence of the repo in the trusted will be checked. If that check fails, the user will be
+            notified through a warning that the repo has not been formally added to the trusted list. In a future
+            release, that this behaviour will be deprecated in favour of ``"check"``.
+            Default is ``None``.
         force_reload (bool, optional): whether to force a fresh download of
             the github repo unconditionally. Does not have any effect if
             ``source = 'local'``. Default is ``False``.
@@ -399,7 +488,8 @@ def load(repo_or_dir, model, *args, source='github', force_reload=False, verbose
             f'Unknown source: "{source}". Allowed values: "github" | "local".')
 
     if source == 'github':
-        repo_or_dir = _get_cache_or_reload(repo_or_dir, force_reload, verbose, skip_validation)
+        repo_or_dir = _get_cache_or_reload(repo_or_dir, force_reload, verbose, skip_validation,
+                                           trust_repo=trust_repo, calling_fn="load")
 
     model = _load_local(repo_or_dir, model, *args, **kwargs)
     return model
