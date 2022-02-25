@@ -758,7 +758,7 @@ class TestHub(TestCase):
                         f.write(line)
 
     @retry(Exception, tries=3)
-    @patch('torch.hub._get_trusted_input', return_value='')
+    @patch('builtins.input', return_value='')
     def test_untrusted_repo(self, input):
         with self.assertRaisesRegex(
                 Exception,
@@ -770,7 +770,7 @@ class TestHub(TestCase):
                 trust_repo=False)
 
     @retry(Exception, tries=3)
-    @patch('torch.hub._get_trusted_input', return_value='y')
+    @patch('builtins.input', return_value='')
     def test_trusted_repo(self, input):
         self._cleanup()
         model = torch.hub.load(
@@ -780,7 +780,7 @@ class TestHub(TestCase):
             trust_repo=False)
 
     @retry(Exception, tries=3)
-    @patch('torch.hub._get_trusted_input', return_value='y')
+    @patch('builtins.input', return_value='')
     def test_check_repo(self, input):
         self._cleanup()
         model = torch.hub.load(
@@ -804,7 +804,7 @@ class TestHub(TestCase):
             assert "You are about to download an untrusted repository." in str(w[-1].message)
 
     @retry(Exception, tries=3)
-    @patch('torch.hub._get_trusted_input', return_value='n')
+    @patch('builtins.input', return_value='')
     def test_check_repo_legacy(self, input):
         self._cleanup()
         # add repo to legacy
