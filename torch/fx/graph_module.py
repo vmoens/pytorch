@@ -710,7 +710,10 @@ class {module_name}(torch.nn.Module):
         memo[id(self)] = res
         fake_mod = torch.nn.Module()
         fake_mod.__dict__ = copy.deepcopy(self.__dict__, memo)
-        GraphModule.__init__(res, fake_mod, fake_mod.__dict__['_graph'])
+        GraphModule.__init__(res, fake_mod, fake_mod.__dict__['_graph'], self.__class__.__name__)
+        # copy extra-attributes that are missed by __init__
+        for key in set(self.__dict__) - set(res.__dict__):
+            res.__dict__[key] = copy.deepcopy(self.__dict__[key])
         # hooks are lost during `GraphModule.__init__`, so we need to copy over
         # them explicitly, note right now we are only copying state_dict related
         # hooks, to reduce bc-related issues, we can copy forward/backward related

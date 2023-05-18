@@ -1031,6 +1031,14 @@ class TestFX(JitTestCase):
         self.assertIsNotNone(h._tracer_cls)
         self.assertTrue(g._tracer_cls == h._tracer_cls)
 
+    def test_deepcopy_extra_attr(self):
+        st = SimpleTest()
+        traced = symbolic_trace(st)
+        traced._test = "foo"
+        traced.graph.lint()
+        copied = copy.deepcopy(traced)
+        assert copied._test == "foo"
+
     def test_unpack_list_better_error(self):
         class SomeArgs(torch.nn.Module):
             def forward(self, a, b):
