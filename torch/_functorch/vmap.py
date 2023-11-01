@@ -207,8 +207,7 @@ def _create_batched_inputs(
             else:
                 batched_input = _add_batch_dim(arg, in_dim, vmap_level)
         batched_inputs.append(batched_input)
-    with _exclude_td_from_pytree()
-    :
+    with _exclude_td_from_pytree():
         return tree_unflatten(batched_inputs, args_spec)
 
 
