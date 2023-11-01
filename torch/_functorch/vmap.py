@@ -8,6 +8,18 @@
 
 import contextlib
 import functools
+from torch import Tensor
+from typing import Any, Callable, Optional, Tuple, Union, List
+
+from torch.utils._pytree import (
+    tree_flatten,
+    tree_unflatten,
+    tree_map_,
+    _broadcast_to_and_flatten,
+    TreeSpec, SUPPORTED_NODES,
+)
+from functools import partial
+import os
 import itertools
 import os
 import threading
@@ -35,6 +47,20 @@ from torch.utils._pytree import (
 in_dims_t = Union[int, tuple]
 out_dims_t = Union[int, tuple[int, ...]]
 
+class _exclude_td_from_pytree:
+    def __init__(self):
+        from torch.dict._pytree import PYTREE_REGISTERED_TDS
+
+        self.PYTREE_REGISTERED_TDS = PYTREE_REGISTERED_TDS
+        self.tdnodes = {}
+
+    def __enter__(self):
+        for tdtype in self.PYTREE_REGISTERED_TDS:
+            self.tdnodes[tdtype] = SUPPORTED_NODES.pop(tdtype)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for tdtype in self.PYTREE_REGISTERED_TDS:
+            SUPPORTED_NODES[tdtype] = self.tdnodes[tdtype]
 
 def doesnt_support_saved_tensors_hooks(f):
     message = (
@@ -105,15 +131,17 @@ def _process_batched_inputs(
             f"The latter is unsupported."
         )
 
-    flat_args, args_spec = tree_flatten(args)
-    flat_in_dims = _broadcast_to_and_flatten(in_dims, args_spec)
-    if flat_in_dims is None:
-        raise ValueError(
-            f"vmap({_get_name(func)}, in_dims={in_dims}, ...)(<inputs>): "
-            f"in_dims is not compatible with the structure of `inputs`. "
-            f"in_dims has structure {tree_flatten(in_dims)[1]} but inputs "
-            f"has structure {args_spec}."
-        )
+    # we want to escape TensorDicts as they take care of adding the batch dimension
+    with _exclude_td_from_pytree():
+        flat_args, args_spec = tree_flatten(args)
+        flat_in_dims = _broadcast_to_and_flatten(in_dims, args_spec)
+        if flat_in_dims is None:
+            raise ValueError(
+                f"vmap({_get_name(func)}, in_dims={in_dims}, ...)(<inputs>): "
+                f"in_dims is not compatible with the structure of `inputs`. "
+                f"in_dims has structure {tree_flatten(in_dims)[1]} but inputs "
+                f"has structure {args_spec}."
+            )
 
     for i, (arg, in_dim) in enumerate(zip(flat_args, flat_in_dims)):
         if not isinstance(in_dim, int) and in_dim is not None:
@@ -122,7 +150,10 @@ def _process_batched_inputs(
                 f"Got in_dim={in_dim} for an input but in_dim must be either "
                 f"an integer dimension or None."
             )
-        if isinstance(in_dim, int) and not isinstance(arg, Tensor):
+        from torch.dict.base import TensorDictBase
+        if isinstance(in_dim, int) and not isinstance(
+            arg, (Tensor, TensorDictBase)
+        ):
             raise ValueError(
                 f"vmap({_get_name(func)}, in_dims={in_dims}, ...)(<inputs>): "
                 f"Got in_dim={in_dim} for an input but the input is of type "
@@ -155,11 +186,30 @@ def _create_batched_inputs(
     flat_in_dims: list[Any], flat_args: list[Any], vmap_level: int, args_spec
 ) -> tuple:
     # See NOTE [Ignored _remove_batch_dim, _add_batch_dim]
-    batched_inputs = [
-        arg if in_dim is None else _add_batch_dim(arg, in_dim, vmap_level)
-        for in_dim, arg in zip(flat_in_dims, flat_args)
-    ]
-    return tree_unflatten(batched_inputs, args_spec)
+    # If tensordict, we remove the dim at batch_size[in_dim] such that the TensorDict can accept
+    # the batched tensors. This will be added in _unwrap_batched
+
+    from torch.dict.base import TensorDictBase
+    batched_inputs = []
+    for in_dim, arg in zip(flat_in_dims, flat_args):
+        if in_dim is None:
+            if isinstance(arg, TensorDictBase):
+                # this may be a perf bottleneck and could benefit from caching
+                # arg = cache(arg.clone)(False)
+                arg = arg.clone(False)
+
+            batched_input = arg
+        else:
+            if isinstance(arg, TensorDictBase):
+                batched_input = arg._add_batch_dim(
+                    in_dim=in_dim, vmap_level=vmap_level
+                )
+            else:
+                batched_input = _add_batch_dim(arg, in_dim, vmap_level)
+        batched_inputs.append(batched_input)
+    with _exclude_td_from_pytree()
+    :
+        return tree_unflatten(batched_inputs, args_spec)
 
 
 def _maybe_remove_batch_dim(name, batched_output, vmap_level, batch_size, out_dim):
@@ -192,7 +242,18 @@ def _unwrap_batched(
     batch_size: int,
     func: Callable,
 ) -> tuple:
-    flat_batched_outputs, output_spec = tree_flatten(batched_outputs)
+    from torch.dict.base import TensorDictBase
+    with _exclude_td_from_pytree():
+        flat_batched_outputs, output_spec = tree_flatten(batched_outputs)
+
+    for out in flat_batched_outputs:
+        # Change here:
+        if isinstance(out, (TensorDictBase, torch.Tensor)):
+            continue
+        raise ValueError(
+            f"vmap({_get_name(func)}, ...): `{_get_name(func)}` must only return "
+            f"Tensors, got type {type(out)} as a return."
+        )
 
     def incompatible_error():
         raise ValueError(
@@ -202,29 +263,37 @@ def _unwrap_batched(
             f"has structure {output_spec}."
         )
 
-    if isinstance(batched_outputs, torch.Tensor):
+    # Here:
+    if isinstance(batched_outputs, (TensorDictBase, torch.Tensor)):
         # Some weird edge case requires us to spell out the following
         # see test_out_dims_edge_case
         if isinstance(out_dims, int):
             flat_out_dims = [out_dims]
         elif isinstance(out_dims, tuple) and len(out_dims) == 1:
             flat_out_dims = out_dims
-        elif out_dims is None:
-            flat_out_dims = [out_dims]
+            out_dims = out_dims[0]
         else:
             incompatible_error()
     else:
         flat_out_dims = _broadcast_to_and_flatten(out_dims, output_spec)
         if flat_out_dims is None:
             incompatible_error()
-
-    flat_outputs = [
-        _maybe_remove_batch_dim(
-            _get_name(func), batched_output, vmap_level, batch_size, out_dim
-        )
-        for batched_output, out_dim in zip(flat_batched_outputs, flat_out_dims)
-    ]
-    return tree_unflatten(flat_outputs, output_spec)
+    flat_outputs = []
+    for batched_output, out_dim in zip(flat_batched_outputs, flat_out_dims):
+        if not isinstance(batched_output, TensorDictBase):
+            out = _remove_batch_dim(
+                batched_output,
+                vmap_level,
+                batch_size,
+                out_dim
+                )
+        else:
+            out = batched_output._remove_batch_dim(
+                vmap_level=vmap_level, batch_size=batch_size, out_dim=out_dim
+            )
+        flat_outputs.append(out)
+    with _exclude_td_from_pytree():
+        return tree_unflatten(flat_outputs, output_spec)
 
 
 def _check_int_or_none(x, func, out_dims):
