@@ -12,7 +12,9 @@ from torch.dict import TensorDictBase
 @exposed_in("torch.func")
 def functional_call(
     module: "torch.nn.Module",
-    parameter_and_buffer_dicts: Union[dict[str, Tensor], Sequence[dict[str, Tensor]], TensorDictBase],
+    parameter_and_buffer_dicts: Union[
+        dict[str, Tensor], Sequence[dict[str, Tensor]], TensorDictBase
+    ],
     args: Optional[Union[Any, tuple]] = None,
     kwargs: Optional[dict[str, Any]] = None,
     *,
