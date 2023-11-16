@@ -1370,7 +1370,7 @@ def grad_and_value_impl(func, argnums, has_aux, args, kwargs) -> Callable:
                     )
                 output, aux = output
 
-            if not isinstance(output, torch.Tensor):
+            if not isinstance(output, (torch.Tensor, torch.dict.TensorDictBase)):
                 raise RuntimeError(
                     "grad_and_value(f)(*args): Expected f(*args) "
                     f"to return a Tensor, got {type(output)}"
