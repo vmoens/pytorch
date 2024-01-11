@@ -2,21 +2,22 @@ from __future__ import annotations
 
 import functools
 import inspect
-import numbers
 import re
 import weakref
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import copy
 from functools import wraps
-from typing import Any, Callable, Iterator, OrderedDict, Sequence, Type
-
-from functorch import dim as ftdim
+from typing import Any, Callable, Dict, Iterator, List, OrderedDict, Sequence, Type
 
 import torch
-from torch import multiprocessing as mp, nn, Tensor
-from torch.utils._pytree import tree_map
-from ._lazy import LazyStackedTensorDict
-from ._torch_func import TD_HANDLED_FUNCTIONS
-from .base import (
+
+from torch.dict._lazy import LazyStackedTensorDict
+from torch.dict._nestedkey import NestedKey
+from torch.dict.tensordict import _SubTensorDict, TensorDict
+from torch.dict._torch_func import TD_HANDLED_FUNCTIONS
+
+from torch.dict.base import (
     _default_is_leaf,
     _is_tensor_collection,
     _register_tensor_class,
@@ -25,16 +26,29 @@ from .base import (
     T,
     TensorDictBase,
 )
-from .tensordict import _SubTensorDict, TensorDict
-from .utils import (
+
+from torch.dict._memmap import MemoryMappedTensor
+from torch.dict.utils import (
     _LOCK_ERROR,
-    as_decorator,
-    Buffer,
+    _zip_strict,
+    BufferLegacy,
     erase_cache,
+    implement_for,
     IndexType,
+    is_batchedtensor,
     lock_blocked,
-    NestedKey,
 )
+from torch import multiprocessing as mp, nn, Tensor
+from torch.utils._pytree import tree_map
+
+from functorch import dim as ftdim
+
+_has_funcdim = True
+
+from torch.nn.parameter import Buffer
+
+
+from torch.compiler import is_compiling
 
 
 def _apply_leaves(data, fn):
@@ -42,7 +56,11 @@ def _apply_leaves(data, fn):
         with data.unlock_():
             for key, val in list(data.items()):
                 data._set_str(
-                    key, _apply_leaves(val, fn), validated=True, inplace=False
+                    key,
+                    _apply_leaves(val, fn),
+                    validated=True,
+                    inplace=False,
+                    non_blocking=False,
                 )
         return data
     elif isinstance(data, LazyStackedTensorDict):
@@ -73,23 +91,34 @@ def _get_args_dict(func, args, kwargs):
 
 
 def _maybe_make_param(tensor):
-    if (
-        isinstance(tensor, (Tensor, ftdim.Tensor))
-        and not isinstance(tensor, nn.Parameter)
-        and tensor.dtype in (torch.float, torch.double, torch.half)
+    if isinstance(tensor, (Tensor, ftdim.Tensor)) and not isinstance(
+        tensor, (nn.Parameter, Buffer, BufferLegacy)
     ):
-        tensor = nn.Parameter(tensor)
+        if tensor.dtype in (torch.float, torch.double, torch.half):
+            tensor = nn.Parameter(tensor)
+        elif not is_batchedtensor(tensor):
+            # convert all non-parameters to buffers
+            # dataptr = tensor.data.data_ptr()
+            tensor = Buffer(tensor)
+        else:
+            # We want to keep the grad_fn of tensors, e.g. param.expand(10) should point to the original param
+            tensor = BufferLegacy(tensor)
     return tensor
 
 
 def _maybe_make_param_or_buffer(tensor):
-    if (
-        isinstance(tensor, (Tensor, ftdim.Tensor))
-        and not isinstance(tensor, nn.Parameter)
-        and tensor.dtype in (torch.float, torch.double, torch.half)
+    if isinstance(tensor, (Tensor, ftdim.Tensor)) and not isinstance(
+        tensor, (nn.Parameter, Buffer)
     ):
-        # convert all non-parameters to buffers
-        tensor = Buffer(tensor)
+        if not tensor.requires_grad and not is_batchedtensor(tensor):
+            # convert all non-parameters to buffers
+            # dataptr = tensor.data.data_ptr()
+            tensor = Buffer(tensor)
+        else:
+            # We want to keep the grad_fn of tensors, e.g. param.expand(10) should point to the original param
+            tensor = BufferLegacy(tensor)
+
+        # assert tensor.data.data_ptr() == dataptr
     return tensor
 
 
@@ -126,7 +155,11 @@ class _unlock_and_set:
             if _self.is_locked:
                 # if the root (TensorDictParams) is locked, we still want to raise an exception
                 raise RuntimeError(_LOCK_ERROR)
-            with _self._param_td.unlock_():
+            with (
+                _self._param_td.unlock_()
+                if _self._param_td.is_locked
+                else nullcontext()
+            ):
                 meth = getattr(_self._param_td, name)
                 out = meth(*args, **kwargs)
             _self._reset_params()
@@ -200,7 +233,7 @@ def _carry_over(func):
         if out is self._param_td:
             return self
         if not isinstance(out, TensorDictParams):
-            out = TensorDictParams(out, no_convert=True)
+            out = TensorDictParams(out, no_convert="skip")
             out.no_convert = self.no_convert
         return out
 
@@ -217,37 +250,43 @@ def _apply_on_data(func):
 
 
 class TensorDictParams(TensorDictBase, nn.Module):
-    r"""Holds a TensorDictBase instance full of parameters.
+    r"""A Wrapper for TensorDictBase with Parameter Exposure.
 
-    This class exposes the contained parameters to a parent nn.Module
-    such that iterating over the parameters of the module also iterates over
-    the leaves of the tensordict.
+    This class is designed to hold a `TensorDictBase` instance that contains parameters, making them accessible to a
+    parent :class:`~torch.nn.Module`. This allows for seamless integration of tensordict parameters into PyTorch modules,
+    enabling operations like parameter iteration and optimization.
 
-    Indexing works exactly as the indexing of the wrapped tensordict.
-    The parameter names will be registered within this module using :meth:`~.TensorDict.flatten_keys("_")`.
-    Therefore, the result of :meth:`~.named_parameters()` and the content of the
-    tensordict will differ slightly in term of key names.
+    Key Features:
 
-    Any operation that sets a tensor in the tensordict will be augmented by
-    a :class:`torch.nn.Parameter` conversion.
+    - Parameter Exposure: Parameters within the tensordict are exposed to the parent module, allowing them to be included
+      in operations like `named_parameters()`.
+    - Indexing: Indexing works similarly to the wrapped tensordict. However, parameter names (in :meth:`~.named_parameters`) are registered using
+      `TensorDict.flatten_keys("_")`, which may result in different key names compared to the tensordict content.
+    - Automatic Conversion: Any tensor set in the tensordict is automatically converted to a :class:`torch.nn.Parameter`,
+      unless specified otherwise through the :attr:`no_convert` keyword argument.
 
-    Args:
-        parameters (TensorDictBase): a tensordict to represent as parameters.
-            Values will be converted to parameters unless ``no_convert=True``.
+    Args
+        parameters (TensorDictBase or dict): The tensordict to represent as parameters. Values are converted to
+            parameters unless `no_convert=True`. If a `dict` is provided, it is wrapped in a `TensorDict` instance.
+            Keyword arguments can also be used.
 
     Keyword Args:
-        no_convert (bool): if ``True``, no conversion to ``nn.Parameter`` will
-            occur at construction and after (unless the ``no_convert`` attribute is changed).
-            If ``no_convert`` is ``True`` and if non-parameters are present, they
-            will be registered as buffers.
-            Defaults to ``False``.
-        lock (bool): if ``True``, the tensordict hosted by TensorDictParams will
-            be locked. This can be useful to avoid unwanted modifications, but
-            also restricts the operations that can be done over the object (and
-            can have significant performance impact when `unlock_()` is required).
-            Defaults to ``False``.
+        no_convert (bool): If `True`, no conversion to `nn.Parameter` occurs and all non-parameter, non-buffer tensors
+            will be converted to a :class:`~torch.nn.Buffer` instance.
+            If ``False``, all tensors with non-integer dtypes will be converted to :class:`~torch.nn.Parameter`
+            whereas integer dtypes will be converted to :class:`~torch.nn.Buffer` instances.
+            Defaults to `False`.
+        lock (bool): If `True`, the tensordict hosted by `TensorDictParams` is locked, preventing modifications and
+            potentially impacting performance when `unlock_()` is required.
+            Defaults to `False`.
 
-    Examples:
+            .. warning:: Because the inner tensordict isn't copied or locked by default, registering the tensordict
+                in a ``TensorDictParams`` and modifying its content afterwards will __not__ update the values within
+                the  ``TensorDictParams`` :meth:`.parameters` and :meth:`~.buffers` sequences.
+
+        **kwargs: Key-value pairs to populate the `TensorDictParams`. Exclusive with the `parameters` input.
+
+    Examples
         >>> from torch import nn
         >>> from torch.dict import TensorDict
         >>> module = nn.Sequential(nn.Linear(3, 4), nn.Linear(4, 4))
@@ -279,33 +318,107 @@ class TensorDictParams(TensorDictBase, nn.Module):
         ...         super().__init__()
         ...         self.params = params
         >>> m = CustomModule(p)
-        >>> # the wrapper supports assignment and values are turned in Parameter
+        >>> # The wrapper supports assignment, and values are converted to Parameters
         >>> m.params['other'] = torch.randn(3)
         >>> assert isinstance(m.params['other'], nn.Parameter)
 
     """
 
     def __init__(
-        self, parameters: TensorDictBase, *, no_convert=False, lock: bool = False
+        self,
+        parameters: TensorDictBase | dict | None = None,
+        *,
+        no_convert=False,
+        lock: bool = False,
+        **kwargs,
     ):
         super().__init__()
-        if isinstance(parameters, TensorDictParams):
-            parameters = parameters._param_td
-        self._param_td = parameters
+        if parameters is None:
+            parameters = kwargs
+        elif kwargs:
+            raise TypeError(
+                f"parameters cannot be passed along with extra keyword arguments, but got {kwargs.keys()} extra args."
+            )
+
+        params = None
+        buffers = None
+        if isinstance(parameters, dict):
+            parameters = TensorDict(parameters)
+        elif isinstance(parameters, TensorDictParams):
+            params = dict(parameters._parameters)
+            buffers = dict(parameters._buffers)
+            parameters = parameters._param_td.copy().lock_()
+            no_convert = "skip"
+
         self.no_convert = no_convert
-        if not no_convert:
-            func = _maybe_make_param
+        if no_convert != "skip":
+            if not no_convert:
+                func = _maybe_make_param
+            else:
+                func = _maybe_make_param_or_buffer
+            self._param_td = _apply_leaves(parameters, lambda x: func(x))
         else:
-            func = _maybe_make_param_or_buffer
-        self._param_td = _apply_leaves(self._param_td, lambda x: func(x))
+            self._param_td = parameters
+
         self._lock_content = lock
         if lock:
             self._param_td.lock_()
-        self._reset_params()
+        self._reset_params(params=params, buffers=buffers)
         self._is_locked = False
         self._locked_tensordicts = []
-        self.__last_op_queue = None
         self._get_post_hook = []
+
+    @classmethod
+    def _new_unsafe(
+        cls,
+        parameters: TensorDictBase,
+        *,
+        no_convert=None,
+        lock: bool = False,
+        params: dict | None = None,
+        buffers: dict | None = None,
+        **kwargs,
+    ):
+        if is_compiling():
+            return TensorDictParams(parameters, no_convert="skip", lock=lock)
+
+        if parameters is None:
+            parameters = kwargs
+
+        if isinstance(parameters, dict):
+            parameters = TensorDict._new_unsafe(parameters, **kwargs)
+            if no_convert is None:
+                # Then _new_unsafe is called from somewhere that doesn't know
+                #  that it's a TDParams and we return a TensorDict (eg, torch.gather)
+                return parameters
+        elif isinstance(parameters, TensorDictParams):
+            if kwargs:
+                raise TypeError(
+                    f"parameters cannot be passed along with extra keyword arguments, but got {kwargs.keys()} extra args."
+                )
+            params = dict(parameters._parameters)
+            buffers = dict(parameters._buffers)
+            parameters = parameters._param_td
+            no_convert = "skip"
+
+        self = TensorDictParams.__new__(cls)
+        nn.Module.__init__(self)
+
+        self._param_td = parameters
+        self.no_convert = no_convert
+        if no_convert != "skip":
+            raise RuntimeError("_new_unsafe requires no_convert to be set to 'skip'")
+        self._lock_content = lock
+        if lock:
+            self._param_td.lock_()
+        self._reset_params(params=params, buffers=buffers)
+        self._is_locked = False
+        self._locked_tensordicts = []
+        self._get_post_hook = []
+        return self
+
+    def __iter__(self):
+        yield from self._param_td.__iter__()
 
     def register_get_post_hook(self, hook):
         """Register a hook to be called after any get operation on leaf tensors."""
@@ -321,24 +434,35 @@ class TensorDictParams(TensorDictBase, nn.Module):
                     val = new_val
         return val
 
-    def _reset_params(self):
+    def _reset_params(self, params: dict | None = None, buffers: dict | None = None):
         parameters = self._param_td
-        param_keys = []
-        params = []
-        buffer_keys = []
-        buffers = []
-        for key, value in parameters.items(True, True):
-            # flatten key
-            if isinstance(key, tuple):
-                key = "_".join(key)
-            if isinstance(value, nn.Parameter):
-                param_keys.append(key)
-                params.append(value)
-            else:
-                buffer_keys.append(key)
-                buffers.append(value)
-        self.__dict__["_parameters"] = dict(zip(param_keys, params))
-        self.__dict__["_buffers"] = dict(zip(buffer_keys, buffers))
+
+        self._parameters.clear()
+        self._buffers.clear()
+
+        if (params is not None) ^ (buffers is not None):
+            raise RuntimeError("both params and buffers must either be None or not.")
+        elif params is None:
+            param_keys = []
+            params = []
+            buffer_keys = []
+            buffers = []
+            for key, value in parameters.items(True, True):
+                # flatten key
+                if isinstance(key, tuple):
+                    key = ".".join(key)
+                if isinstance(value, nn.Parameter):
+                    param_keys.append(key)
+                    params.append(value)
+                else:
+                    buffer_keys.append(key)
+                    buffers.append(value)
+
+            self._parameters.update(dict(_zip_strict(param_keys, params)))
+            self._buffers.update(dict(_zip_strict(buffer_keys, buffers)))
+        else:
+            self._parameters.update(params)
+            self._buffers.update(buffers)
 
     @classmethod
     def __torch_function__(
@@ -378,16 +502,14 @@ class TensorDictParams(TensorDictBase, nn.Module):
     def __setitem__(
         self,
         index: IndexType,
-        value: TensorDictBase | dict | numbers.Number | CompatibleType,
-    ) -> None:
-        ...
+        value: Any,
+    ) -> None: ...
 
     @lock_blocked
     @_unlock_and_set
     def set(
         self, key: NestedKey, item: CompatibleType, inplace: bool = False, **kwargs: Any
-    ) -> TensorDictBase:
-        ...
+    ) -> TensorDictBase: ...
 
     @lock_blocked
     def update(
@@ -396,16 +518,21 @@ class TensorDictParams(TensorDictBase, nn.Module):
         clone: bool = False,
         inplace: bool = False,
         *,
+        non_blocking: bool = False,
         keys_to_update: Sequence[NestedKey] | None = None,
+        is_leaf: Callable[[Type], bool] | None = None,
+        update_batch_size: bool = False,
+        ignore_lock: bool = False,
     ) -> TensorDictBase:
-        if not self.no_convert:
-            func = _maybe_make_param
-        else:
-            func = _maybe_make_param_or_buffer
-        if isinstance(input_dict_or_td, TensorDictBase):
-            input_dict_or_td = input_dict_or_td.apply(func)
-        else:
-            input_dict_or_td = tree_map(func, input_dict_or_td)
+        # Deprecating this since _set_tuple will do it thx to the decorator
+        # if not self.no_convert:
+        #     func = _maybe_make_param
+        # else:
+        #     func = _maybe_make_param_or_buffer
+        # if _is_tensor_collection(type(input_dict_or_td)):
+        #     input_dict_or_td = input_dict_or_td.apply(func)
+        # else:
+        #     input_dict_or_td = tree_map(func, input_dict_or_td)
         with self._param_td.unlock_():
             TensorDictBase.update(
                 self,
@@ -413,23 +540,25 @@ class TensorDictParams(TensorDictBase, nn.Module):
                 clone=clone,
                 inplace=inplace,
                 keys_to_update=keys_to_update,
+                non_blocking=non_blocking,
+                is_leaf=is_leaf,
             )
             self._reset_params()
         return self
 
     @lock_blocked
     @_unlock_and_set
-    def pop(
-        self, key: NestedKey, default: str | CompatibleType = NO_DEFAULT
-    ) -> CompatibleType:
-        ...
+    def pop(self, key: NestedKey, default: Any = NO_DEFAULT) -> CompatibleType: ...
+
+    @lock_blocked
+    @_unlock_and_set
+    def popitem(self): ...
 
     @lock_blocked
     @_unlock_and_set
     def rename_key_(
-        self, old_key: str, new_key: str, safe: bool = False
-    ) -> TensorDictBase:
-        ...
+        self, old_key: NestedKey, new_key: NestedKey, safe: bool = False
+    ) -> TensorDictBase: ...
 
     def map(
         self,
@@ -439,6 +568,10 @@ class TensorDictParams(TensorDictBase, nn.Module):
         chunksize: int = None,
         num_chunks: int = None,
         pool: mp.Pool = None,
+        generator: torch.Generator | None = None,
+        max_tasks_per_child: int | None = None,
+        worker_threads: int = 1,
+        mp_start_method: str | None = None,
     ):
         raise RuntimeError(
             "Cannot call map on a TensorDictParams object. Convert it "
@@ -452,13 +585,14 @@ class TensorDictParams(TensorDictBase, nn.Module):
         fn: Callable,
         *others: TensorDictBase,
         batch_size: Sequence[int] | None = None,
-        device: torch.device | None = None,
-        names: Sequence[str] | None = None,
+        device: torch.device | None = NO_DEFAULT,
+        names: Sequence[str] | None = NO_DEFAULT,
         inplace: bool = False,
         default: Any = NO_DEFAULT,
+        filter_empty: bool | None = None,
+        call_on_nested: bool = False,
         **constructor_kwargs,
-    ) -> TensorDictBase:
-        ...
+    ) -> TensorDictBase | None: ...
 
     @_unlock_and_set(inplace=True)
     def named_apply(
@@ -466,29 +600,66 @@ class TensorDictParams(TensorDictBase, nn.Module):
         fn: Callable,
         *others: TensorDictBase,
         batch_size: Sequence[int] | None = None,
-        device: torch.device | None = None,
-        names: Sequence[str] | None = None,
+        device: torch.device | None = NO_DEFAULT,
+        names: Sequence[str] | None = NO_DEFAULT,
         inplace: bool = False,
         default: Any = NO_DEFAULT,
+        filter_empty: bool | None = None,
+        call_on_nested: bool = False,
         **constructor_kwargs,
-    ) -> TensorDictBase:
-        ...
+    ) -> TensorDictBase | None: ...
 
     @_unlock_and_set(inplace=True)
-    def _apply_nest(*args, **kwargs):
-        ...
+    def _apply_nest(*args, **kwargs): ...
+
+    @_fallback
+    def _multithread_apply_flat(
+        self,
+        fn: Callable,
+        *others: T,
+        call_on_nested: bool = False,
+        default: Any = NO_DEFAULT,
+        named: bool = False,
+        nested_keys: bool = False,
+        prefix: tuple = (),
+        is_leaf: Callable[[Type], bool] | None = None,
+        executor: ThreadPoolExecutor,
+        futures: List[Future],
+        local_futures: List,
+    ) -> None: ...
+
+    @_fallback
+    def _multithread_rebuild(
+        self,
+        *,
+        batch_size: Sequence[int] | None = None,
+        device: torch.device | None = NO_DEFAULT,
+        names: Sequence[str] | None = NO_DEFAULT,
+        inplace: bool = False,
+        checked: bool = False,
+        out: TensorDictBase | None = None,
+        filter_empty: bool = False,
+        executor: ThreadPoolExecutor,
+        futures: List[Future],
+        local_futures: List,
+        subs_results: Dict[Future, Any] | None = None,
+        multithread_set: bool = False,  # Experimental
+        **constructor_kwargs,
+    ) -> None: ...
 
     @_get_post_hook
     @_fallback
-    def get(
-        self, key: NestedKey, default: str | CompatibleType = NO_DEFAULT
-    ) -> CompatibleType:
-        ...
+    def get(self, key: NestedKey, default: Any = None) -> CompatibleType: ...
 
     @_get_post_hook
     @_fallback
-    def __getitem__(self, index: IndexType) -> TensorDictBase:
-        ...
+    def __getitem__(self, index: IndexType) -> Any: ...
+
+    @_fallback
+    def _set_device(self, device: torch.device) -> T: ...
+
+    @_fallback
+    def auto_device_(self) -> T: ...
 
     __getitems__ = __getitem__
 
@@ -510,7 +681,7 @@ class TensorDictParams(TensorDictBase, nn.Module):
             return self
         return TensorDictParams(params)
 
-    def clone(self, recurse: bool = True) -> TensorDictBase:
+    def _clone(self, recurse: bool = True) -> TensorDictBase:
         """Clones the TensorDictParams.
 
         .. warning::
@@ -531,12 +702,17 @@ class TensorDictParams(TensorDictBase, nn.Module):
 
         """
         if not recurse:
-            return TensorDictParams(self._param_td.clone(False), no_convert=True)
+            return TensorDictParams._new_unsafe(
+                self._param_td._clone(False),
+                no_convert="skip",
+                params=dict(self._parameters),
+                buffers=dict(self._buffers),
+            )
 
         memo = {}
 
         def _clone(tensor, memo=memo):
-            result = memo.get(tensor, None)
+            result = memo.get(tensor)
             if result is not None:
                 return result
 
@@ -545,42 +721,59 @@ class TensorDictParams(TensorDictBase, nn.Module):
                     tensor.data.clone(), requires_grad=tensor.requires_grad
                 )
             else:
-                result = Buffer(tensor.data.clone(), requires_grad=tensor.requires_grad)
+                result = Buffer(tensor.data.clone())
             memo[tensor] = result
             return result
 
-        return TensorDictParams(self._param_td.apply(_clone), no_convert=True)
+        return TensorDictParams(self._param_td.apply(_clone), no_convert="skip")
 
     @_fallback
-    def chunk(self, chunks: int, dim: int = 0) -> tuple[TensorDictBase, ...]:
-        ...
+    def chunk(self, chunks: int, dim: int = 0) -> tuple[TensorDictBase, ...]: ...
 
     @_fallback
-    def unbind(self, dim: int) -> tuple[TensorDictBase, ...]:
-        ...
+    def _unbind(self, dim: int) -> tuple[TensorDictBase, ...]: ...
+
+    @classmethod
+    def from_dict(cls, *args, **kwargs):
+        td = TensorDict.from_dict(*args, **kwargs)
+        return TensorDictParams(td)
 
     @_fallback
-    def to_tensordict(self):
-        ...
+    def to_tensordict(self, *, retain_none: bool | None = None): ...
 
     @_fallback
     def to_h5(
         self,
         filename,
         **kwargs,
-    ):
-        ...
+    ): ...
 
     def __hash__(self):
-        return hash((id(self), id(self.__dict__.get("_param_td", None))))
+        return hash((id(self), id(self.__dict__.get("_param_td"))))
 
     @_fallback
-    def __eq__(self, other: object) -> TensorDictBase:
-        ...
+    def __eq__(self, other: object) -> TensorDictBase: ...
 
     @_fallback
-    def __ne__(self, other: object) -> TensorDictBase:
-        ...
+    def __ne__(self, other: object) -> TensorDictBase: ...
+
+    @_fallback
+    def __xor__(self, other: object) -> TensorDictBase: ...
+
+    @_fallback
+    def __or__(self, other: object) -> TensorDictBase: ...
+
+    @_fallback
+    def __ge__(self, other: object) -> TensorDictBase: ...
+
+    @_fallback
+    def __gt__(self, other: object) -> TensorDictBase: ...
+
+    @_fallback
+    def __le__(self, other: object) -> TensorDictBase: ...
+
+    @_fallback
+    def __lt__(self, other: object) -> TensorDictBase: ...
 
     def __getattr__(self, item: str) -> Any:
         if not item.startswith("_"):
@@ -592,121 +785,96 @@ class TensorDictParams(TensorDictBase, nn.Module):
             return super().__getattr__(item)
 
     @_fallback
-    def _change_batch_size(self, *args, **kwargs):
-        ...
+    def _change_batch_size(self, *args, **kwargs): ...
 
     @_fallback
-    def _erase_names(self, *args, **kwargs):
-        ...
+    def _erase_names(self, *args, **kwargs): ...
 
     @_get_post_hook
     @_fallback
-    def _get_str(self, *args, **kwargs):
-        ...
+    def _get_str(self, *args, **kwargs): ...
 
     @_get_post_hook
     @_fallback
-    def _get_tuple(self, *args, **kwargs):
-        ...
+    def _get_tuple(self, *args, **kwargs): ...
 
     @_get_post_hook
     @_fallback
-    def _get_at_str(self, key, idx, default):
-        ...
+    def _get_at_str(self, key, idx, default): ...
 
     @_get_post_hook
     @_fallback
-    def _get_at_tuple(self, key, idx, default):
-        ...
+    def _get_at_tuple(self, key, idx, default): ...
 
     @_fallback
-    def _add_batch_dim(self, *args, **kwargs):
-        ...
+    def _add_batch_dim(self, *args, **kwargs): ...
 
     @_fallback
-    def _convert_to_tensordict(self, *args, **kwargs):
-        ...
+    def _convert_to_tensordict(self, *args, **kwargs): ...
 
     @_fallback
-    def _get_names_idx(self, *args, **kwargs):
-        ...
+    def _get_names_idx(self, *args, **kwargs): ...
 
     @_fallback
-    def _index_tensordict(self, *args, **kwargs):
-        ...
+    def _index_tensordict(self, *args, **kwargs): ...
 
     @_fallback
-    def _remove_batch_dim(self, *args, **kwargs):
-        ...
+    def _remove_batch_dim(self, *args, **kwargs): ...
 
     @_fallback
-    def _has_names(self, *args, **kwargs):
-        ...
+    def _maybe_remove_batch_dim(self, *args, **kwargs): ...
+
+    @_fallback
+    def _has_names(self, *args, **kwargs): ...
 
     @_unlock_and_set
-    def _rename_subtds(self, *args, **kwargs):
-        ...
+    def _rename_subtds(self, *args, **kwargs): ...
 
     @_unlock_and_set
-    def _set_at_str(self, *args, **kwargs):
-        ...
+    def _set_at_str(self, *args, **kwargs): ...
 
     @_fallback
-    def _set_at_tuple(self, *args, **kwargs):
-        ...
+    def _set_at_tuple(self, *args, **kwargs): ...
 
     @_unlock_and_set
-    def _set_str(self, *args, **kwargs):
-        ...
+    def _set_str(self, *args, **kwargs): ...
 
     @_unlock_and_set
-    def _set_tuple(self, *args, **kwargs):
-        ...
+    def _set_tuple(self, *args, **kwargs): ...
 
     @_unlock_and_set
-    def _create_nested_str(self, *args, **kwargs):
-        ...
+    def _create_nested_str(self, *args, **kwargs): ...
 
     @_fallback_property
-    def batch_size(self) -> torch.Size:
-        ...
+    def batch_size(self) -> torch.Size: ...
 
     @_fallback
-    def contiguous(self, *args, **kwargs):
-        ...
+    def contiguous(self, *args, **kwargs): ...
 
     @lock_blocked
     @_unlock_and_set
-    def del_(self, *args, **kwargs):
-        ...
+    def del_(self, *args, **kwargs): ...
 
     @_fallback
-    def detach_(self, *args, **kwargs):
-        ...
+    def detach_(self, *args, **kwargs): ...
 
     @_fallback_property
-    def device(self):
-        ...
+    def device(self): ...
 
     @_fallback
-    def entry_class(self, *args, **kwargs):
-        ...
+    def entry_class(self, *args, **kwargs): ...
 
     @_fallback
-    def is_contiguous(self, *args, **kwargs):
-        ...
+    def is_contiguous(self, *args, **kwargs): ...
 
     @_fallback
-    def keys(self, *args, **kwargs):
-        ...
+    def keys(self, *args, **kwargs): ...
 
     @_fallback
-    def masked_fill(self, *args, **kwargs):
-        ...
+    def masked_fill(self, *args, **kwargs): ...
 
     @_fallback
-    def masked_fill_(self, *args, **kwargs):
-        ...
+    def masked_fill_(self, *args, **kwargs): ...
 
     def memmap_(
         self,
@@ -722,21 +890,54 @@ class TensorDictParams(TensorDictBase, nn.Module):
 
     _load_memmap = TensorDict._load_memmap
 
-    @_fallback_property
-    def names(self):
-        ...
+    def make_memmap(
+        self,
+        key: NestedKey,
+        shape: torch.Size | torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> MemoryMappedTensor:
+        raise RuntimeError(
+            "Making a memory-mapped tensor after instantiation isn't currently allowed for TensorDictParams."
+            "If this feature is required, open an issue on GitHub to trigger a discussion on the topic!"
+        )
 
-    @_fallback
+    def make_memmap_from_storage(
+        self,
+        key: NestedKey,
+        storage: torch.UntypedStorage,
+        shape: torch.Size | torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> MemoryMappedTensor:
+        raise RuntimeError(
+            "Making a memory-mapped tensor after instantiation isn't currently allowed for TensorDictParams."
+            "If this feature is required, open an issue on GitHub to trigger a discussion on the topic!"
+        )
+
+    def make_memmap_from_tensor(
+        self, key: NestedKey, tensor: torch.Tensor, *, copy_data: bool = True
+    ) -> MemoryMappedTensor:
+        raise RuntimeError(
+            "Making a memory-mapped tensor after instantiation isn't currently allowed for TensorDictParams."
+            "If this feature is required, open an issue on GitHub to trigger a discussion on the topic!"
+        )
+
+    @_fallback_property
+    def names(self): ...
+
     def pin_memory(self, *args, **kwargs):
-        ...
+        if kwargs.get("inplace", False):
+            raise RuntimeError(
+                f"Cannot pin_memory in-place with {type(self).__name__}."
+            )
+        return _fallback(self.pin_memory)(self, *args, **kwargs)
 
     @_unlock_and_set
-    def select(self, *args, **kwargs):
-        ...
+    def _select(self, *args, **kwargs): ...
 
     @_fallback
-    def share_memory_(self, *args, **kwargs):
-        ...
+    def share_memory_(self, *args, **kwargs): ...
 
     @property
     def is_locked(self) -> bool:
@@ -748,128 +949,134 @@ class TensorDictParams(TensorDictBase, nn.Module):
         self._is_locked = bool(value)
 
     @_fallback_property
-    def is_shared(self) -> bool:
-        ...
+    def is_shared(self) -> bool: ...
 
     @_fallback_property
-    def is_memmap(self) -> bool:
-        ...
+    def is_memmap(self) -> bool: ...
+
+    @property
+    def _is_shared(self) -> bool:
+        return self._param_td._is_shared
+
+    @property
+    def _is_memmap(self) -> bool:
+        return self._param_td._is_memmap
 
     @_fallback_property
-    def shape(self) -> torch.Size:
-        ...
+    def shape(self) -> torch.Size: ...
 
-    def _propagate_lock(self, _lock_parents_weakrefs=None):
+    def _propagate_lock(self, _lock_parents_weakrefs=None, *, is_compiling):
         """Registers the parent tensordict that handles the lock."""
         self._is_locked = True
-        if _lock_parents_weakrefs is None:
-            _lock_parents_weakrefs = []
-        self._lock_parents_weakrefs += _lock_parents_weakrefs
-        _lock_parents_weakrefs.append(weakref.ref(self))
+        if not is_compiling:
+            if _lock_parents_weakrefs is None:
+                _lock_parents_weakrefs = []
+            self._lock_parents_weakrefs += _lock_parents_weakrefs
+            _lock_parents_weakrefs.append(weakref.ref(self))
         # we don't want to double-lock the _param_td attrbute which is locked by default
         if not self._param_td.is_locked:
-            self._param_td._propagate_lock(_lock_parents_weakrefs)
+            self._param_td._propagate_lock(
+                _lock_parents_weakrefs, is_compiling=is_compiling
+            )
 
     @erase_cache
     def _propagate_unlock(self):
         # if we end up here, we can clear the graph associated with this td
         self._is_locked = False
 
-        self._is_shared = False
-        self._is_memmap = False
-
         if not self._lock_content:
             return self._param_td._propagate_unlock()
+        return []
 
     unlock_ = TensorDict.unlock_
     lock_ = TensorDict.lock_
 
     @property
     def data(self):
-        return self._param_td.detach()
+        return self._param_td._data()
+
+    @property
+    def grad(self):
+        return self._param_td._grad()
 
     @_unlock_and_set(inplace=True)
     def flatten_keys(
         self, separator: str = ".", inplace: bool = False
-    ) -> TensorDictBase:
-        ...
+    ) -> TensorDictBase: ...
 
     @_unlock_and_set(inplace=True)
     def unflatten_keys(
         self, separator: str = ".", inplace: bool = False
-    ) -> TensorDictBase:
-        ...
+    ) -> TensorDictBase: ...
 
     @_unlock_and_set(inplace=True)
-    def exclude(self, *keys: str, inplace: bool = False) -> TensorDictBase:
-        ...
+    def _exclude(
+        self, *keys: NestedKey, inplace: bool = False, set_shared: bool = True
+    ) -> TensorDictBase: ...
 
     @_carry_over
-    def transpose(self, dim0, dim1):
-        ...
+    def from_dict_instance(
+        self,
+        input_dict,
+        *,
+        auto_batch_size: bool = False,
+        batch_size=None,
+        device=None,
+        batch_dims=None,
+    ): ...
+
+    @_carry_over
+    def _legacy_transpose(self, dim0, dim1): ...
 
     @_fallback
-    def where(self, condition, other, *, out=None, pad=None):
-        ...
+    def _transpose(self, dim0, dim1): ...
+
+    @_fallback
+    def where(self, condition, other, *, out=None, pad=None): ...
 
     @_fallback
     def _permute(
         self,
         *dims_list: int,
         dims: list[int] | None = None,
-    ) -> TensorDictBase:
-        ...
+    ) -> TensorDictBase: ...
 
     @_carry_over
-    def permute(
+    def _legacy_permute(
         self,
         *dims_list: int,
         dims: list[int] | None = None,
-    ) -> TensorDictBase:
-        ...
+    ) -> TensorDictBase: ...
 
     @_fallback
-    def _squeeze(self, dim: int | None = None) -> TensorDictBase:
-        ...
+    def _squeeze(self, dim: int | None = None) -> TensorDictBase: ...
 
     @_carry_over
-    def squeeze(self, dim: int | None = None) -> TensorDictBase:
-        ...
+    def _legacy_squeeze(self, dim: int | None = None) -> TensorDictBase: ...
 
     @_fallback
-    def _unsqueeze(self, dim: int) -> TensorDictBase:
-        ...
+    def _unsqueeze(self, dim: int) -> TensorDictBase: ...
 
     @_carry_over
-    def unsqueeze(self, dim: int) -> TensorDictBase:
-        ...
-
-    @_fallback
-    def __xor__(self, other):
-        ...
-
-    @_fallback
-    def __or__(self, other):
-        ...
+    def _legacy_unsqueeze(self, dim: int) -> TensorDictBase: ...
 
     _check_device = TensorDict._check_device
     _check_is_shared = TensorDict._check_is_shared
 
     @_fallback
-    def all(self, dim: int = None) -> bool | TensorDictBase:
-        ...
+    def _cast_reduction(self, **kwargs): ...
 
     @_fallback
-    def any(self, dim: int = None) -> bool | TensorDictBase:
-        ...
+    def all(self, dim: int = None) -> bool | TensorDictBase: ...
 
     @_fallback
-    def expand(self, *args, **kwargs) -> T:
-        ...
+    def any(self, dim: int = None) -> bool | TensorDictBase: ...
 
     @_fallback
-    def masked_select(self, mask: Tensor) -> T:
-        ...
+    def expand(self, *args, **kwargs) -> T: ...
+
+    @_fallback
+    def masked_select(self, mask: Tensor) -> T: ...
 
     @_fallback
     def memmap_like(
@@ -877,20 +1084,24 @@ class TensorDictParams(TensorDictBase, nn.Module):
         prefix: str | None = None,
         copy_existing: bool = False,
         num_threads: int = 0,
-    ) -> T:
-        ...
+    ) -> T: ...
 
     @_fallback
-    def reshape(self, *shape: int):
-        ...
+    def reshape(self, *shape: int): ...
 
     @_fallback
-    def split(self, split_size: int | list[int], dim: int = 0) -> list[TensorDictBase]:
-        ...
+    def repeat_interleave(self, *shape: int): ...
 
     @_fallback
-    @as_decorator()
-    def to_module(
+    def _repeat(self, *repeats: int): ...
+
+    @_fallback
+    def split(
+        self, split_size: int | list[int], dim: int = 0
+    ) -> list[TensorDictBase]: ...
+
+    @_fallback
+    def _to_module(
         self,
         module,
         *,
@@ -899,16 +1110,17 @@ class TensorDictParams(TensorDictBase, nn.Module):
         swap_dest=None,
         memo=None,
         use_state_dict: bool = False,
-    ):
-        ...
+        non_blocking: bool = False,
+    ): ...
+
+    @_fallback
+    def _view(self, *args, **kwargs): ...
 
     @_carry_over
-    def view(self, *args, **kwargs):
-        ...
+    def _legacy_view(self, *args, **kwargs): ...
 
     @_unlock_and_set
-    def create_nested(self, key):
-        ...
+    def create_nested(self, key): ...
 
     def __repr__(self):
         return f"TensorDictParams(params={self._param_td})"
@@ -918,10 +1130,12 @@ class TensorDictParams(TensorDictBase, nn.Module):
         include_nested: bool = False,
         leaves_only: bool = False,
         is_leaf: Callable[[Type], bool] | None = None,
+        *,
+        sort: bool = False,
     ) -> Iterator[CompatibleType]:
         if is_leaf is None:
             is_leaf = _default_is_leaf
-        for v in self._param_td.values(include_nested, leaves_only):
+        for v in self._param_td.values(include_nested, leaves_only, sort=sort):
             if not is_leaf(type(v)):
                 yield v
                 continue
@@ -968,18 +1182,17 @@ class TensorDictParams(TensorDictBase, nn.Module):
         unexpected_keys,
         error_msgs,
     ):
-        data = (
-            TensorDict(
-                {
-                    key: val
-                    for key, val in state_dict.items()
-                    if key.startswith(prefix) and val is not None
-                },
-                [],
-            )
-            .unflatten_keys(".")
-            .get(prefix[:-1])
-        )
+        data = TensorDict(
+            {
+                key: val
+                for key, val in state_dict.items()
+                if key.startswith(prefix) and val is not None
+            },
+            [],
+        ).unflatten_keys(".")
+        prefix = tuple(key for key in prefix.split(".") if key)
+        if prefix:
+            data = data.get(prefix)
         self.data.load_state_dict(data)
 
     def items(
@@ -987,56 +1200,51 @@ class TensorDictParams(TensorDictBase, nn.Module):
         include_nested: bool = False,
         leaves_only: bool = False,
         is_leaf: Callable[[Type], bool] | None = None,
+        *,
+        sort: bool = False,
     ) -> Iterator[CompatibleType]:
         if is_leaf is None:
             is_leaf = _default_is_leaf
-        for k, v in self._param_td.items(include_nested, leaves_only):
+        for k, v in self._param_td.items(include_nested, leaves_only, sort=sort):
             if not is_leaf(type(v)):
                 yield k, v
                 continue
             yield k, self._apply_get_post_hook(v)
 
     @_apply_on_data
-    def zero_(self) -> T:
-        ...
+    def zero_(self) -> T: ...
 
     @_apply_on_data
-    def fill_(self, key: NestedKey, value: float | bool) -> T:
-        ...
+    def fill_(self, key: NestedKey, value: float | bool) -> T: ...
 
     @_apply_on_data
-    def copy_(self, tensordict: T, non_blocking: bool = None) -> T:
-        ...
+    def copy_(self, tensordict: T, non_blocking: bool = None) -> T: ...
 
     @_apply_on_data
-    def set_at_(self, key: NestedKey, value: CompatibleType, index: IndexType) -> T:
-        ...
+    def set_at_(self, key: NestedKey, value: CompatibleType, index: IndexType) -> T: ...
 
     @_apply_on_data
     def set_(
         self,
         key: NestedKey,
         item: CompatibleType,
-    ) -> T:
-        ...
+    ) -> T: ...
 
     @_apply_on_data
     def _stack_onto_(
         self,
         list_item: list[CompatibleType],
         dim: int,
-    ) -> T:
-        ...
+    ) -> T: ...
 
     @_apply_on_data
     def _stack_onto_at_(
         self,
-        key: str,
+        key: NestedKey,
         list_item: list[CompatibleType],
         dim: int,
         idx: IndexType,
-    ) -> T:
-        ...
+    ) -> T: ...
 
     @_apply_on_data
     def update_(
@@ -1044,9 +1252,9 @@ class TensorDictParams(TensorDictBase, nn.Module):
         input_dict_or_td: dict[str, CompatibleType] | T,
         clone: bool = False,
         *,
+        non_blocking: bool = False,
         keys_to_update: Sequence[NestedKey] | None = None,
-    ) -> T:
-        ...
+    ) -> T: ...
 
     @_apply_on_data
     def update_at_(
@@ -1055,93 +1263,52 @@ class TensorDictParams(TensorDictBase, nn.Module):
         idx: IndexType,
         clone: bool = False,
         *,
+        non_blocking: bool = False,
         keys_to_update: Sequence[NestedKey] | None = None,
-    ) -> T:
-        ...
+    ) -> T: ...
 
     @_apply_on_data
-    def apply_(self, fn: Callable, *others) -> T:
-        ...
+    def apply_(self, fn: Callable, *others, **kwargs) -> T: ...
 
+    @implement_for("torch", "2.1")
     def _apply(self, fn, recurse=True):
-        """Modifies torch.nn.Module._apply to work with Buffer class."""
-        if recurse:
-            for module in self.children():
-                module._apply(fn)
+        self._param_td._erase_cache()
+        param_td = self._param_td
+        self._param_td = param_td.copy()
+        # Keep a list of buffers to update .data only
+        bufs = dict(self._buffers)
+        out: TensorDictBase = super()._apply(fn, recurse=recurse)
+        for key, val in bufs.items():
+            val.data = self._buffers[key].data
+            self._buffers[key] = val
+        # Check device and shape
+        cbs = out._check_batch_size(raise_exception=False)
+        if not cbs:
+            out.auto_batch_size_()
+        cd = out._check_device(raise_exception=False)
+        if not cd:
+            out.auto_device_()
+        return out
 
-        def compute_should_use_set_data(tensor, tensor_applied):
-            if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
-                # If the new tensor has compatible tensor type as the existing tensor,
-                # the current behavior is to change the tensor in-place using `.data =`,
-                # and the future behavior is to overwrite the existing tensor. However,
-                # changing the current behavior is a BC-breaking change, and we want it
-                # to happen in future releases. So for now we introduce the
-                # `torch.__future__.get_overwrite_module_params_on_conversion()`
-                # global flag to let the user control whether they want the future
-                # behavior of overwriting the existing tensor or not.
-                return not torch.__future__.get_overwrite_module_params_on_conversion()
-            else:
-                return False
-
-        for key, param in self._parameters.items():
-            if param is None:
-                continue
-            # Tensors stored in modules are graph leaves, and we don't want to
-            # track autograd history of `param_applied`, so we have to use
-            # `with torch.no_grad():`
-            with torch.no_grad():
-                param_applied = fn(param)
-            should_use_set_data = compute_should_use_set_data(param, param_applied)
-            if should_use_set_data:
-                param.data = param_applied
-                out_param = param
-            else:
-                out_param = nn.Parameter(param_applied, param.requires_grad)
-                self._parameters[key] = out_param
-
-            if param.grad is not None:
-                with torch.no_grad():
-                    grad_applied = fn(param.grad)
-                should_use_set_data = compute_should_use_set_data(
-                    param.grad, grad_applied
-                )
-                if should_use_set_data:
-                    out_param.grad.data = grad_applied
-                else:
-                    out_param.grad = grad_applied.requires_grad_(
-                        param.grad.requires_grad
-                    )
-
-        for key, buffer in self._buffers.items():
-            if buffer is None:
-                continue
-            # Tensors stored in modules are graph leaves, and we don't want to
-            # track autograd history of `buffer_applied`, so we have to use
-            # `with torch.no_grad():`
-            with torch.no_grad():
-                buffer_applied = fn(buffer)
-            should_use_set_data = compute_should_use_set_data(buffer, buffer_applied)
-            if should_use_set_data:
-                buffer.data = buffer_applied
-                out_buffer = buffer
-            else:
-                out_buffer = Buffer(buffer_applied, buffer.requires_grad)
-                self._buffers[key] = out_buffer
-
-            if buffer.grad is not None:
-                with torch.no_grad():
-                    grad_applied = fn(buffer.grad)
-                should_use_set_data = compute_should_use_set_data(
-                    buffer.grad, grad_applied
-                )
-                if should_use_set_data:
-                    out_buffer.grad.data = grad_applied
-                else:
-                    out_buffer.grad = grad_applied.requires_grad_(
-                        buffer.grad.requires_grad
-                    )
-
-        return self
+    @implement_for("torch", None, "2.1")
+    def _apply(self, fn):  # noqa: F811
+        self._param_td._erase_cache()
+        param_td = self._param_td
+        self._param_td = param_td.copy()
+        # Keep a list of buffers to update .data only
+        bufs = dict(self._buffers)
+        out: TensorDictBase = super()._apply(fn)
+        for key, val in bufs.items():
+            val.data = self._buffers[key].data
+            self._buffers[key] = val
+        # Check device and shape
+        cbs = out._check_batch_size(raise_exception=False)
+        if not cbs:
+            out.auto_batch_size_()
+        cd = out._check_device(raise_exception=False)
+        if not cd:
+            out.auto_device_()
+        return out
 
 
 TDPARAM_HANDLED_FUNCTIONS = copy(TD_HANDLED_FUNCTIONS)
@@ -1160,15 +1327,10 @@ def implements_for_tdparam(torch_function: Callable) -> Callable[[Callable], Cal
 
 @implements_for_tdparam(torch.empty_like)
 def _empty_like(td: TensorDictBase, *args, **kwargs) -> TensorDictBase:
-    try:
-        tdclone = td.clone()
-    except Exception as err:
-        raise RuntimeError(
-            "The tensordict passed to torch.empty_like cannot be "
-            "cloned, preventing empty_like to be called. "
-            "Consider calling tensordict.to_tensordict() first."
-        ) from err
-    return tdclone.apply_(lambda x: torch.empty_like(x, *args, **kwargs))
+    return td.apply(
+        lambda x: torch.empty_like(x, *args, **kwargs),
+        device=kwargs.pop("device", NO_DEFAULT),
+    )
 
 
 _register_tensor_class(TensorDictParams)

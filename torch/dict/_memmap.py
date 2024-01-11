@@ -16,7 +16,7 @@ import torch
 
 from torch import distributed as dist
 
-from torch.multiprocessing.reductions import ForkingPickler
+from multiprocessing.reduction import ForkingPickler
 
 from .utils import implement_for
 

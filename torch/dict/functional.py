@@ -201,9 +201,9 @@ def dense_stack_tds(
 
     Examples:
         >>> import torch
-        >>> from tensordict import TensorDict
-        >>> from tensordict import dense_stack_tds
-        >>> from tensordict.tensordict import assert_allclose_td
+        >>> from torch.dict import TensorDict
+        >>> from torch.dict import dense_stack_tds
+        >>> from torch.dict.tensordict import assert_allclose_td
         >>> td0 = TensorDict({"a": torch.zeros(3)},[])
         >>> td1 = TensorDict({"a": torch.zeros(4), "b": torch.zeros(2)},[])
         >>> td_lazy = torch.stack([td0, td1], dim=0)
