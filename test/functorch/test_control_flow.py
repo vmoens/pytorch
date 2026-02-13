@@ -8339,6 +8339,26 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
         self.assertTrue(result[0][0].abs().sum() <= 0.1)
         self.assertTrue(result[0][1].abs().sum() <= 0.1)
 
+    @parametrize("backend", ["eager", "aot_eager"])
+    def test_while_loop_compile_dynamic(self, backend):
+        def cond_fn(x, i):
+            return i < 3
+
+        def body_fn(x, i):
+            return (x + 1.0, i + 1)
+
+        def fn(x):
+            return torch.while_loop(cond_fn, body_fn, (x, torch.tensor(0)))
+
+        compiled = torch.compile(fn, dynamic=True, backend=backend)
+        r1 = compiled(torch.zeros(3))
+        r2 = compiled(torch.zeros(5))
+        self.assertEqual(r1[0], torch.tensor([3.0, 3.0, 3.0]))
+        self.assertEqual(r2[0], torch.tensor([3.0, 3.0, 3.0, 3.0, 3.0]))
+        # Both should use same compiled graph (no recompile)
+        self.assertEqual(r1[1], torch.tensor(3))
+        self.assertEqual(r2[1], torch.tensor(3))
+
     @skipIfTorchDynamo("Skip because we're testing export")
     @parametrize("strict", [True, False])
     @parametrize("dynamic", [True, False])
