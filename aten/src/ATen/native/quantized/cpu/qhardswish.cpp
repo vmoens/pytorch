@@ -1,16 +1,20 @@
-#include <ATen/ATen.h>
-#include <ATen/NativeFunctions.h>
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/core/Tensor.h>
+#include <ATen/Context.h>
 #include <torch/library.h>
-#include <ATen/quantized/Quantizer.h>
-#include <ATen/native/quantized/cpu/quantized_ops.h>
+#include <ATen/native/quantized/cpu/QuantizedOps.h>
 #include <ATen/native/quantized/cpu/init_qnnpack.h>
-#include <ATen/native/quantized/cpu/qnnpack_utils.h>
+#include <ATen/native/quantized/cpu/QnnpackUtils.h>
 #include <caffe2/utils/threadpool/pthreadpool-cpp.h>
 
-#include <algorithm>
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#else
+#include <ATen/ops/_empty_affine_quantized.h>
+#endif
 
-namespace at {
-namespace native {
+
+namespace at::native {
 
 DEFINE_DISPATCH(qhardswish_stub);
 
@@ -74,7 +78,7 @@ Tensor qnnpack_hardswish(const Tensor& qx, Tensor& qy) {
 
 } // namespace
 
-Tensor quantized_hardswish(const Tensor& qx, double output_scale, int64_t output_zero_point) {
+static Tensor quantized_hardswish(const Tensor& qx, double output_scale, int64_t output_zero_point) {
   Tensor qy = at::_empty_affine_quantized(
       qx.sizes(),
       at::device(kCPU).dtype(qx.scalar_type()),
@@ -97,4 +101,4 @@ TORCH_LIBRARY_IMPL(quantized, QuantizedCPU, m) {
   m.impl(TORCH_SELECTIVE_NAME("quantized::hardswish"), TORCH_FN(quantized_hardswish));
 }
 
-}}  // namespace at::native
+}  // namespace at::native

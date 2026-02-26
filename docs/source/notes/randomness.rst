@@ -32,6 +32,18 @@ CPU and CUDA)::
     import torch
     torch.manual_seed(0)
 
+Some PyTorch operations may use random numbers internally.
+:meth:`torch.svd_lowrank()` does this, for instance. Consequently, calling it
+multiple times back-to-back with the same input arguments may give different
+results. However, as long as :meth:`torch.manual_seed()` is set to a constant
+at the beginning of an application and all other sources of nondeterminism have
+been eliminated, the same series of random numbers will be generated each time
+the application is run in the same environment.
+
+It is also possible to obtain identical results from an operation that uses
+random numbers by setting :meth:`torch.manual_seed()` to the same value between
+subsequent calls.
+
 Python
 ------
 
@@ -88,7 +100,7 @@ Please check the documentation for :meth:`torch.use_deterministic_algorithms()`
 for a full list of affected operations. If an operation does not act correctly
 according to the documentation, or if you need a deterministic implementation
 of an operation that does not have one, please submit an issue:
-`<https://github.com/pytorch/pytorch/issues?q=label:%22topic:%20determinism%22>`_
+`<https://github.com/pytorch/pytorch/issues?q=label:%22module:%20determinism%22>`_
 
 For example, running the nondeterministic CUDA implementation of :meth:`torch.Tensor.index_add_`
 will throw an error::
@@ -113,10 +125,6 @@ deterministic implementation will be used::
             [[ 0.1509,  1.8027],
              [ 0.0333, -1.1444]]], device='cuda:0')
 
-Furthermore, if you are using CUDA tensors, and your CUDA version is 10.2 or greater, you
-should set the environment variable `CUBLAS_WORKSPACE_CONFIG` according to CUDA documentation:
-`<https://docs.nvidia.com/cuda/cublas/index.html#cublasApi_reproducibility>`_
-
 CUDA convolution determinism
 ----------------------------
 While disabling CUDA convolution benchmarking (discussed above) ensures that
@@ -131,6 +139,22 @@ CUDA RNN and LSTM
 -----------------
 In some versions of CUDA, RNNs and LSTM networks may have non-deterministic behavior.
 See :meth:`torch.nn.RNN` and :meth:`torch.nn.LSTM` for details and workarounds.
+
+Filling uninitialized memory
+----------------------------
+Operations like :meth:`torch.empty` and :meth:`torch.Tensor.resize_` can return
+tensors with uninitialized memory that contain undefined values. Using such a
+tensor as an input to another operation is invalid if determinism is required,
+because the output will be nondeterministic. But there is nothing to actually
+prevent such invalid code from being run. So for safety,
+:attr:`torch.utils.deterministic.fill_uninitialized_memory` is set to ``True``
+by default, which will fill the uninitialized memory with a known value if
+:code:`torch.use_deterministic_algorithms(True)` is set. This will prevent the
+possibility of this kind of nondeterministic behavior.
+
+However, filling uninitialized memory is detrimental to performance. So if your
+program is valid and does not use uninitialized memory as the input to an
+operation, then this setting can be turned off for better performance.
 
 DataLoader
 ..........
