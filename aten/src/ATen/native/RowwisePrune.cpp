@@ -1,11 +1,19 @@
 // Copyright 2004-present Facebook. All Rights Reserved.
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 
-#include <ATen/ATen.h>
+#include <ATen/core/Tensor.h>
+#include <ATen/Dispatch.h>
 #include <c10/util/irange.h>
 
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/_rowwise_prune_native.h>
+#include <ATen/ops/empty.h>
+#endif
 
-namespace at {
-namespace native {
+namespace at::native {
 
 namespace {
 
@@ -17,7 +25,7 @@ std::tuple<Tensor, Tensor> _rowwise_prune_helper(
   auto mask_contig = mask.contiguous();
   auto mask_data = mask_contig.data_ptr<bool>();
   for (const auto i : c10::irange(mask.numel())) {
-    num_non_masked_rows += (((mask_data[i] == true)) ? 1 : 0);
+    num_non_masked_rows += ((mask_data[i] == true) ? 1 : 0);
   }
   int num_cols = weights.size(1);
   auto pruned_2d_tensor = at::empty({num_non_masked_rows, num_cols},
@@ -104,4 +112,4 @@ std::tuple<Tensor, Tensor> _rowwise_prune(const Tensor& weights,
                                         compressed_indices_dtype);
 }
 
-}} // namespace at::native
+} // namespace at::native

@@ -5,8 +5,7 @@
 #include <regex>
 #include <stack>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 namespace {
 
 /**
@@ -273,8 +272,8 @@ bool SubgraphMatcher::matchNodes(const Node* n1, Node* n2) {
       if (!endsWith(real_typename, pattern_typename)) {
         GRAPH_DEBUG(
             "Nodes did not match because expected module type is different:\n");
-        GRAPH_DEBUG("  actualtype:    ", real_typename, "\n");
-        GRAPH_DEBUG("  expected type: ", pattern_typename, "\n");
+        GRAPH_DEBUG("  actualtype:    ", real_typename, '\n');
+        GRAPH_DEBUG("  expected type: ", pattern_typename, '\n');
         GRAPH_DEBUG("Nodes:", *n1, *n2);
         return false;
       }
@@ -367,5 +366,4 @@ std::vector<Match> findPatternMatches(const Graph& pattern, Graph& graph) {
   return matches;
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit
