@@ -239,15 +239,20 @@ def _maybe_remove_batch_dim(
             )
         return batched_output
 
-    # out_dim is non None
-    if not isinstance(batched_output, torch.Tensor):
-        raise ValueError(
-            f"vmap({name}, ...): `{name}` must only return "
-            f"Tensors, got type {type(batched_output)}. "
-            "Did you mean to set out_dims= to None for output?"
-        )
+    if isinstance(batched_output, torch.Tensor):
+        return _remove_batch_dim(batched_output, vmap_level, batch_size, out_dim)
 
-    return _remove_batch_dim(batched_output, vmap_level, batch_size, out_dim)
+    if batched_output is None:
+        return None
+
+    if isinstance(batched_output, (int, float, bool, complex)):
+        return torch.full((batch_size,), batched_output)
+
+    raise ValueError(
+        f"vmap({name}, ...): `{name}` must only return "
+        f"Tensors, got type {type(batched_output)}. "
+        "Did you mean to set out_dims= to None for output?"
+    )
 
 
 # Undos the batching (and any batch dimensions) associated with the `vmap_level`.
@@ -437,7 +442,7 @@ def _concat_chunked_outputs(
     out_dims: out_dims_t,
     arg_spec: TreeSpec,
     flat_output_chunks: list[tuple[Any, ...] | None],
-) -> list[Tensor]:
+) -> list[Any]:
     # concat chunks on out_dim
     flat_out_dims = _broadcast_to_and_flatten(out_dims, arg_spec)
     if flat_out_dims is None:
@@ -446,12 +451,15 @@ def _concat_chunked_outputs(
         raise AssertionError(
             f"len(flat_out_dims)={len(flat_out_dims)} != len(flat_output_chunks)={len(flat_output_chunks)}"
         )
-    flat_output: list[Tensor] = []
+    flat_output: list[Any] = []
     for idx, out_dim in enumerate(flat_out_dims):
         chunk = flat_output_chunks[idx]
         if chunk is None:
             raise AssertionError(f"chunk at index {idx} must not be None")
-        flat_output.append(torch.cat(chunk, dim=out_dim))
+        if all(c is None for c in chunk):
+            flat_output.append(None)
+        else:
+            flat_output.append(torch.cat(chunk, dim=out_dim))
         # release tensors
         flat_output_chunks[idx] = None
 
