@@ -451,6 +451,38 @@ def cudagraphify_impl(
     return deferred_cudagraphify
 
 
+def protect_pool_inputs_for_partitioned_call(
+    callable: Callable[..., Any], device_index: int
+) -> Callable[..., Any]:
+    """Wrap a partitioned callable to clone top-level pool-referencing inputs.
+
+    When a compiled function is split into multiple CUDA-graph partitions,
+    the first partition's ``dealloc_current_path_weakrefs`` frees *all* pool
+    storage from the previous generation — including storage that later
+    partitions' inputs still reference.  ``_protect_inputs_from_dealloc``
+    inside ``_run`` only sees *one* partition's inputs, so cross-partition
+    references are left dangling.
+
+    This wrapper runs before any partition and clones every top-level input
+    whose storage lives in the pool, so that the subsequent dealloc cannot
+    invalidate another partition's pending inputs.
+    """
+
+    def protected(inputs: list[InputType]) -> OutputType:
+        container = get_container(device_index)
+        manager = container.tree_manager
+        if (
+            manager is not None
+            and manager.current_node is not None
+            and (manager.in_recording or manager.in_warmup)
+            and manager.can_start_new_generation()
+        ):
+            manager._protect_inputs_from_dealloc(inputs)
+        return callable(inputs)
+
+    return protected
+
+
 @contextlib.contextmanager
 def dynamo_timed_cudagraph(
     name: str,
