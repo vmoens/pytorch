@@ -2177,11 +2177,55 @@ class CUDAGraphTreeManager:
             > torch._inductor.config.triton.cudagraph_unexpected_rerecord_limit
         )
 
+    def _protect_inputs_from_dealloc(
+        self, new_inputs: list[InputType]
+    ) -> None:
+        """Clone input tensors whose storage lives in the CUDA graph pool.
+
+        When outputs from a previous run are fed back as inputs (e.g. the
+        standard RL loop ``state = compiled_step(state)``), their storage
+        is inside the CUDA graph pool.  ``dealloc_current_path_weakrefs``
+        frees that storage and marks it with an access-error, so any
+        subsequent read from those tensors would raise.
+
+        Cloning affected inputs into fresh storage before the dealloc
+        preserves their data while still allowing the pool memory to be
+        reclaimed.
+        """
+        if self.current_node is None:
+            return
+
+        pool_ptrs: OrderedSet[int] = OrderedSet()
+        for storage_ref in self.current_node.path_live_weakrefs():
+            pool_ptrs.add(storage_ref.data_ptr())
+
+        if not pool_ptrs:
+            return
+
+        def _maybe_clone(x: Any) -> Any:
+            if (
+                isinstance(x, torch.Tensor)
+                and x.untyped_storage().data_ptr() in pool_ptrs
+            ):
+                return x.clone()
+            return x
+
+        for i, inp in enumerate(new_inputs):
+            new_inputs[i] = pytree.tree_map(_maybe_clone, inp)
+
     def _run(self, new_inputs: list[InputType], function_id: FunctionID) -> OutputType:
         # we will try to end the current execution lazily, since
         # we dont want to do unnecessary checking of the existing outputs
         # on the hot path, but both recording and warmup only happen once
         # so we check up front
+
+        # When starting a new generation, try_end_curr_recording /
+        # try_end_curr_warmup will call dealloc_current_path_weakrefs which
+        # frees pool storage.  If any new_inputs reference that storage
+        # (output→input feedback), clone them first.
+        if (self.in_recording or self.in_warmup) and self.can_start_new_generation():
+            self._protect_inputs_from_dealloc(new_inputs)
+
         if self.in_recording:
             self.try_end_curr_recording(function_id)
 
